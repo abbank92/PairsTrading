@@ -1,0 +1,673 @@
+---
+title: "Pairs Trading"
+author: "Alex Bank"
+output: pdf_document
+---
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+
+downloadPriceDF <- function(stock, start = 2010, nyears = 1) {
+    require(BatchGetSymbols)
+    startdate <- paste(start, '01', '01', sep = '-')
+    enddate <- paste(start+nyears, '01', '01', sep = '-')
+    out <- BatchGetSymbols(tickers = stock, first.date = startdate, last.date = enddate, do.cache = FALSE)
+    cat('\n')
+    if(out$df.control$download.status != 'OK') stop(paste0('something went wrong downloading ', stock, 'prices'))
+    stockDF <- data.frame(date = as.character(out$df.tickers$ref.date),
+                          price = out$df.tickers$price.adjusted)
+    return(stockDF)
+} #uses Yahoo finance
+downloadStockPairDF <- function(stock1, stock2, start = 2010, nyears = 1) {
+  stock1df <- downloadPriceDF(stock1, start = start, nyears = nyears)
+  stock2df <- downloadPriceDF(stock2, start = start, nyears = nyears)
+  if (!identical(stock1df$date, stock2df$date)) {
+    stop('Dates are wack')
+    #rid <- which(stock1df$date != stock2df$date)
+    #stock1df <- stock1df[-rid, ]
+    #stock2df <- stock2df[-rid, ]
+  }
+  df <- data.frame(stock1 = stock1df$price,
+                   stock2 = stock2df$price,
+                   ratio = stock1df$price/stock2df$price)
+  return(df)
+}
+
+plotStocks <- function(stockPairDF) {
+  max <- max(max(stockPairDF$stock1), max(stockPairDF$stock2))
+  plot(x = 1:length(stockPairDF$stock1), y = stockPairDF$stock1, type = 'l', col = 'red',
+       ylim = c(0, max), xlab = '', ylab = 'Price')
+  lines(x = 1:length(stockPairDF$stock1), y = stockPairDF$stock2, col = 'blue')
+  legend('topleft', legend = c('stock1', 'stock2'), col = c('red', 'blue'), lty = 1, cex = .8)
+}
+plotRatio <- function(stockDF, k=1) {
+  m <- mean(stockDF$ratio); s <- sd(stockDF$ratio)
+  plot(x=1:length(stockDF$ratio), y=stockDF$ratio,
+       type='l',
+       xlab='', ylab=paste('Ratio (k=',k,')', sep = ''))
+  abline(h=c(m-k*s,m,m+k*s), lty=c(2,1,2))
+}
+findPositions <- function(ratio, m, s, k = 1) {
+  len <- length(ratio)
+  toReturn <- list(); lind <- 1
+  finger <- 1
+  openquestionmark <- FALSE
+  
+  while (finger < len) {
+
+    if (!openquestionmark) { #means we have to find the first place to open a position
+      highones <- which(ratio[finger:len]>(m+s*k))
+      lowones <- which(ratio[finger:len]<(m-s*k))
+      if (length(highones)>0 | length(lowones)>0) {
+       start <- min(highones[1], lowones[1], na.rm = TRUE) + finger - 1
+       highorlow <- ifelse(identical(start, highones[1]+finger-1),
+                           1, -1)
+       finger <- start
+       openquestionmark <- TRUE
+      }
+      else finger <- len
+    }
+    else { #we need to find where to close the position
+      close <- ifelse(highorlow == 1,
+                      which(ratio[finger:len]<m)[1],
+                      which(ratio[finger:len]>m)[1])
+      if (is.na(close)) { #means there is no good close; must close on last day
+        close <- len
+      }
+      else close <- close+finger-1
+      
+      finger <- close
+      toReturn[[lind]] <- c(start, close, highorlow)
+      lind <- lind + 1
+      openquestionmark <- FALSE
+    }
+       
+  }#end of while loop
+  return(toReturn)
+}
+addPositions <- function(ratio, positions) {
+  for (p in positions) {
+    points(x=p[1],y=ratio[p[1]],col='green',pch=19)
+    points(x=p[2],y=ratio[p[2]],col='red',pch=19)
+  }
+}
+positionProfit <- function(stocksDF, positions, net = TRUE) {
+  if (length(positions) == 0) return(0)
+  cashcash <- numeric(length(positions))
+  i <- 1
+  for (p in positions) {
+    shares1 <- 1/stocksDF$stock1[p[1]]
+    shares2 <- 1/stocksDF$stock2[p[1]]
+    profit1 <- p[3]*-1 * shares1 * stocksDF$stock1[p[2]]
+    profit2 <- p[3] * shares2 * stocksDF$stock2[p[2]]
+    fees <- 0.003 * (1+1+abs(profit1)+abs(profit2))
+    cashcash[i] <- profit1+profit2-fees
+    i <- i+1
+  }
+  if (net) return(sum(cashcash))
+  return(cashcash)
+}
+findOptimalK <- function(stocksDF, plot = FALSE) {
+  ratio <- stocksDF$ratio; m <- mean(stocksDF$ratio); s <- sd(stocksDF$ratio)
+  kmax <- max(abs(ratio - m))/s
+  kvalues <- seq(0, kmax, length = 100)
+  kprof <- sapply(kvalues, function(x) positionProfit(stocksDF = stocksDF,
+                                                      findPositions(ratio, m, s, k=x)))
+  ind <- which(kprof == max(kprof))[1]
+  bestk <- kvalues[ind]
+  
+  if (plot) {
+    plot(x=kvalues, y=kprof, type='p',
+         xlab='k value', ylab='Profit')
+    points(x=bestk, y=kprof[ind], pch=19, col='red')
+  }
+  
+  return(bestk)
+}
+evaluatePairsTrading <- function(stocksDF, trainingFrac = 0.5, plot = FALSE) {
+  cutoff <- ceiling(nrow(stocksDF)*trainingFrac)
+  train <- stocksDF[1:cutoff,]
+  test <- stocksDF[(cutoff+1):nrow(stocksDF),]
+  k <- findOptimalK(train)
+  m <- mean(train$ratio); s <- sd(train$ratio)
+  pos <- findPositions(test$ratio, m, s, k=k)
+  
+  if (plot) {
+    plot(x=1:nrow(stocksDF), y=stocksDF$ratio,
+         type = 'l', xlab = '', ylab = paste('Ratio (k=',k,')',sep = ''))
+    abline(h = c(m-s*k, m, m+s*k), lty=c(2,1,2))
+    abline(v = cutoff)
+    for (p in pos) {
+      points(x=p[1]+cutoff,y=stocksDF$ratio[p[1]+cutoff],col='green',pch=19)
+      points(x=p[2]+cutoff,y=stocksDF$ratio[p[2]+cutoff],col='red',pch=19)
+    }
+  }
+  
+  return(positionProfit(test, pos))
+}
+
+simulateStockPair <- function(n=1000, sigma1=1, sigma2=1, rho=1, psi=0, b1=0, b2=0, plot=FALSE) {
+  stock1 <- numeric(n); stock2 <- numeric(n)
+  x1 <- 2; x2 <- 2
+  for (t in 1:n) {
+    stock1[t] <- 40 + b1*t + x1; stock2[t] <- 35 + b2*t + x2
+    x1 <- rho*x1 + (1-rho)*psi*x2 + rnorm(1,0,sigma1)
+    x2 <- rho*x2 + (1-rho)*psi*x1 + rnorm(1,0,sigma2)
+  }
+  r <- stock1/stock2
+  df <- data.frame(stock1 = stock1, stock2 = stock2, ratio = r)
+  if (plot) plotStocks(df)
+  return(df)
+}
+simulateDistribution <- function(nrep = 100, returnCorrelation = FALSE, ...) {
+  dist <- numeric(nrep)
+  if (returnCorrelation) {
+    for (i in 1:nrep) {
+      df <- simulateStockPair(...)
+      dist[i] <- cor(df$stock1, df$stock2)
+    }
+    return(dist)
+  }
+  for (i in 1:nrep) {
+    dist[i] <- evaluatePairsTrading(simulateStockPair(...))
+  }
+  return(dist)
+}
+heatmaprhopsi <- function(steps = 10, returnCorrelation=FALSE) {
+  rho <- seq(0,1,length.out = steps); psi <- seq(0,1,length.out = steps)
+  grid <- expand.grid(rho=rho, psi=psi)
+  fill <- numeric(steps*steps)
+  if (returnCorrelation) { #return mean correlation for given rho/psi
+    for (i in 1:(steps*steps)) {
+      fill[i] <- mean(simulateDistribution(returnCorrelation = TRUE,
+                                           rho = grid[i,1],
+                                           psi = grid[i,2]))
+    }
+  }
+  else { #return median profit for given rho/psi
+    for (i in 1:(steps*steps)) {
+      fill[i] <- median(simulateDistribution(rho = grid[i,1],
+                                             psi = grid[i,2]))
+    }
+  }
+  grid$f <- fill
+  
+  library(ggplot2)
+  p <- ggplot(grid, aes(x=rho, y=psi, fill=f))
+  p <- p + geom_tile()
+  p <- p + scale_fill_gradient(low='white', high='steelblue')
+  return(p)
+}
+heatmapsigmarho <- function(steps = 10) {
+  rho <- seq(0,1,length.out = 5)
+  sigma1 <- seq(0,5,length.out = steps)
+  grid <- expand.grid(rho=rho, sigma1=sigma1)
+  fill <- numeric(5*steps)
+  
+  for (i in 1:(5*steps)) {
+    fill[i] <- median(simulateDistribution(rho = grid[i,1],
+                                           sigma1 = grid[i,2]))
+  }
+  grid$f <- fill
+  
+  library(ggplot2)
+  p <- ggplot(grid, aes(x=rho, y=sigma1, fill=f))
+  p <- p + geom_tile()
+  p <- p + scale_fill_gradient(low='white', high='steelblue')
+  return(p)
+}
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+athleisure10 <- downloadStockPairDF('NKE', 'UAA', start = 2006, nyears = 10)
+cor(athleisure10$stock1, athleisure10$stock2)
+```
+
+To start out this exploration of the Pairs Trading strategy, we can look at two recognizable, highly-correlated athletic-wear companies. The following graphs look at ten years of price data for Nike and Under Armour starting in 2006. The two athletic clothing companies have a strong positive correlation of $0.97$ for this period. "Stock1" is Nike and "Stock2" is Under Armour.
+
+```{r echo=FALSE}
+plotStocks(athleisure10)
+plotRatio(athleisure10)
+```
+
+Implementing the Pairs Trading strategy on these stocks (with a threshold standard deviation of 1) we get the following dates for opening and closing:
+```{r echo=FALSE}
+positions <- findPositions(athleisure10$ratio,
+                           mean(athleisure10$ratio),
+                           sd(athleisure10$ratio))
+opens <- numeric(length(positions))
+closes <- numeric(length(positions))
+for (i in 1:length(positions)) {
+  opens[i] <- positions[[i]][1]
+  closes[i] <- positions[[i]][2]
+}
+message('Opens: ',paste0(opens, collapse = ' '))
+message('Closes: ',paste0(closes, collapse = ' '))
+plotRatio(athleisure10)
+addPositions(athleisure10$ratio, positions = positions)
+```
+
+Now let's do the math. Our first position opens on day nine, where Nike is worth $\$5.848574$ a share and Under Armour is worth $\$4.8775$ a share. Since this is a "low" position, we buy $\$1$ of the undervalued Nike stock, and sell $\$1$ of the overvalued Under Armour stock. This starts our position net zero, with $\frac{1}{5.848574}=0.1709818$ shares of NKE and $\frac{1}{4.8775}=0.2050231$ shares of UAA.
+
+We close this position on day 499, where Nike is worth $\$10.86585$ and Under Armour is worth $\$5.29125$. We sell our NKE share for a profit of $0.1709818*10.86585=1.857863$, and we buy UAA for a loss of $0.2050231*5.29125=1.084828$.
+
+Now our fees are three-tenths percent of all transactions, or $.003(1+1+1.857863+1.084828)=0.01482807$. Thus, our total profit for the position is $1.857863-1.084828-0.01482807=0.7582069$.
+
+Below we can see our positionProfit function returns the same profit for this position. We can also see that for our three positions, we achieved a total profit of $\$1.75$.
+
+```{r echo=FALSE}
+message('Position Profit for first position: ',
+        positionProfit(athleisure10, positions = positions, net = FALSE)[1])
+message('Total Profit: ',
+        positionProfit(athleisure10, positions = positions))
+```
+
+All the previous work was done assuming that $k=1$. Now we will work to manipulate $k$ to maximize our profit.
+
+```{r echo=FALSE}
+k <- findOptimalK(athleisure10, plot = TRUE)
+message("Our Optimal 'k': ", k)
+positions2 <- findPositions(athleisure10$ratio,
+                            mean(athleisure10$ratio),
+                            sd(athleisure10$ratio),
+                            k = k)
+message("Profit with new k: ",
+        positionProfit(athleisure10, positions2))
+plotRatio(athleisure10, k = k)
+addPositions(athleisure10$ratio, positions2)
+```
+
+Now that we have a way to train our strategy, we can look at the pairs trading on different pairs of stocks. This uses the mean and optimal k value from the first half of the data to set the thresholds for the second half of the data, which is where we are buying and selling stocks.
+```{r include=FALSE}
+movies10 <- downloadStockPairDF('NFLX', 'RGC', start = 2006, nyears = 10)
+energyandshipping10 <- downloadStockPairDF('CHK', 'LAKE', start = 2006, nyears = 10)
+gamesandoil10 <- downloadStockPairDF('GRVY', 'XOM', start = 2006, nyears = 10)
+```
+```{r echo=FALSE}
+message('Correlation between Netflix and Regal Cinemas: ',cor(movies10$stock1,movies10$stock2))
+message('Profits for this pair: ',evaluatePairsTrading(movies10, plot = TRUE))
+
+message('Correlation between Chesapeak Energy and Lakeland Shipping: ',
+        cor(energyandshipping10$stock1,energyandshipping10$stock2))
+message('Profits for this pair: ',evaluatePairsTrading(energyandshipping10))
+
+message('Correlation between Gravity (gaming company) and Exxon-Mobile: ',
+        cor(gamesandoil10$stock1,gamesandoil10$stock2))
+message('Profits for this pair: ',evaluatePairsTrading(gamesandoil10))
+```
+We can see that our strategy worked best on Nike and Under Armour, most likely because they were the most correlated pair of stocks and had a general increase in price over time. Likewise, even though Netflix and Regal Cinemas have a high correlation, the strategy failed to take into account Netflix's enormous growth over the past few years. Shorting Netflix based on the idea that it was overvalued ended up being a very bad play; closing out the position on the last day led to heavy losses (the position can be seen on the graph above). The other two pairs work as expected. The energy and shipping company have a lower correlation, and lead to profits lower than those of the Nike-Under Armour pair. The last pair of negatively correlated stocks lead to negative profits.
+
+Now we will work with simulated stock prices to allow us to test and better understand our trading strategy. Simulating one-hundred pairs of stocks (each with 1000 days of price data, a within-stock correlation of 0.9, and a between-stock correlation of 0.9), the following lists the mean profit we achieve, and the mean correlation between the stocks.
+
+```{r echo=FALSE}
+dist <- simulateDistribution(rho=.9, psi=.9)
+m <- mean(dist)
+s <- sd(dist)
+message('Mean profit: ',m)
+message('Standard deviation of profit: ',s)
+err <- qnorm(0.975)*s/sqrt(length(dist))
+message('Our 95% confidence interval is: ',m-err,'—',m+err)
+
+corDist <- simulateDistribution(returnCorrelation = TRUE, rho=.9, psi=.9)
+m <- mean(corDist)
+s <- sd(corDist)
+message('\n','Mean correlation: ',m)
+message('Standard deviation of correlation: ',s)
+err <- qnorm(0.975)*s/sqrt(length(corDist))
+message('Our 95% confidence interval is: ',m-err,'—',m+err)
+```
+
+The following graphs help visualize the effect the VAR1 perameters, rho and psi, have on our trading strategy.
+
+```{r echo=FALSE}
+p <- heatmaprhopsi(steps = 10, returnCorrelation = TRUE)
+print(p + ggtitle("Mean Correlation on 100 Simulated Pairs"))
+
+p <- heatmaprhopsi(steps = 10)
+print(p + ggtitle("Median Profit on 100 Simulated Pairs"))
+```
+
+The heat map of the correlation is not extremely interesting; when the pair of stocks is given a high between-stock correleation, the stocks have a high correlation. The only column of note is when inner-stock correlation equals one. This in effect causes the between-stock correlation to be zero, so any non-zero correlation exhibited by stocks with rho equals one is only a product of the noise variable and chance.
+
+From the heat map of median profits, we see a trend that low between-stock and inner-stock correlation leads to higher profits. This is in one way surprising; we based the strategy on the idea that we would profit when stocks were correlated. On the other hand, it makes sense that a lower rho value would mean higher profits. When the rho value is high, the price of the stock is very based on the previous price of the stock, meaning the price can remain relatively stable. When rho is low, the price of the stocks can fluxuate, and so can the ratio. This type of behavior can be seen in the following graph where rho is zero and psi is one.
+
+```{r echo=FALSE}
+simulateStockPair2 <- function(n=1000, sigma1=1, sigma2=1, rho=1, psi=0, b1=0, b2=0, plot=FALSE) {
+  stock1 <- numeric(n); stock2 <- numeric(n)
+  x1 <- 2; x2 <- 10
+  for (t in 1:n) {
+    stock1[t] <- 40 + b1*t + x1; stock2[t] <- 35 + b2*t + x2
+    x1 <- rho*x1 + (1-rho)*psi*x2 + rnorm(1,0,sigma1)
+    x2 <- rho*x2 + (1-rho)*psi*x1 + rnorm(1,0,sigma2)
+  }
+  r <- stock1/stock2
+  df <- data.frame(stock1 = stock1, stock2 = stock2, ratio = r)
+  if (plot) plotStocks(df)
+  return(df)
+}
+pair <- simulateStockPair2(rho = 0, psi = .1)
+plotRatio(pair)
+```
+
+Since the strategy works best when stocks become over/undervalued or when there is a lot of volatility, we would expect higher profits from higher sigma values since the noise variable will cause more fluxuation. The following heat map explores the mean profits for a range of sigma and rho values, and confirms what we expected.
+
+```{r echo=FALSE}
+p <- heatmapsigmarho(steps=5)
+print(p + ggtitle('Median Profit on 100 Simulated Pairs'))
+```
+
+These charts make it clear that the pairs trading strategy works best on volatile, correlated stocks. When the stocks are highly correlated, the ratio should be close to constant. This means that any volatiliy that moves the ratio away from the mean is just noise, and that the assumptions we make in our trading strategy are uphelp in practice. It follows that a high inner-stock correlation will keep the price more constant, and thus will not realize very high profits.
+
+In order to further refine the strategy, we can continually update the mean and standard deviation using all the available data up to that point. Theoretically, this should give us better standards for where we open and close our positions because we are using all the data available. What we see below is the result of using this strategy on our Nike/Under Armour data, and in fact we end up losing money using a value of $k=1$ even though the old strategy made a profit.
+
+```{r echo=FALSE}
+findPositionsExtension <- function(ratio, k=1) {
+  len <- length(ratio)
+  toReturn <- list(); lind <- 1
+  finger <- 2
+  openquestionmark <- FALSE
+  m <- numeric(len); s <- numeric(len)
+  for (i in 1:len) {
+    m[i] <- mean(ratio[1:i])
+    s[i] <- sd(ratio[1:i])
+  }
+  
+  while (finger < len) {
+    
+    if (!openquestionmark) { #means we have to find the first place to open a position
+      if (ratio[finger] > m[finger]+s[finger]*k) {
+        start <- finger
+        finger <- finger + 1
+        highorlow <- 1
+        openquestionmark <- TRUE
+      }
+      else if (ratio[finger] < m[finger]-s[finger]*k) {
+        start <- finger
+        finger <- finger + 1
+        highorlow <- -1
+        openquestionmark <- TRUE
+      }
+      else {
+        finger <- finger + 1
+      }
+    }
+    
+    else { #find a place to close position
+      if (highorlow == 1) {
+        while (openquestionmark) {
+          if (ratio[finger]<m[finger]) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            lind <- lind + 1
+            openquestionmark <- FALSE
+          }
+          else if (finger == len) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            openquestionmark <- FALSE
+          }
+          else {
+            finger <- finger + 1
+          }
+        }
+      }
+      else {
+        while(openquestionmark) {
+          if (ratio[finger]>m[finger]) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            lind <- lind + 1
+            openquestionmark <- FALSE
+          }
+          else if (finger == len) {
+            toReturn[[lind]] <- c(start, finger, -1)
+            openquestionmark <- FALSE
+          }
+          else {
+            finger <- finger + 1
+          }
+        }
+      }
+    }
+  }
+  return(toReturn)
+}
+plotRatioExtension <- function(stockDF, k=1) {
+  n <- nrow(stockDF)
+  m <- numeric(n); s <- numeric(n)
+  for (i in 1:n) {
+    m[i] <- mean(stockDF$ratio[1:i])
+    s[i] <- sd(stockDF$ratio[1:i])
+  }
+  plot(x=1:n, y=stockDF$ratio,
+       type='l',
+       xlab='', ylab=paste('Ratio (k=',k,')', sep = ''), main='Ratio with Moving Mean/SD')
+  lines(x=1:n, y=m, col='slateblue4')
+  lines(x=1:n, y=m+s*k, col='slateblue1', lty=2)
+  lines(x=1:n, y=m-s*k, col='slateblue1', lty=2)
+}
+pos <- findPositionsExtension(athleisure10$ratio, k=1)
+plotRatioExtension(athleisure10)
+addPositions(athleisure10$ratio, pos)
+message('Profit: ',positionProfit(athleisure10,pos))
+```
+
+In order to attempt to fix this problem, we can wait for a certain amount of time before starting to open positions. In other words, we will use the first three years of the data (the first 750 days since there are about 250 trading days a year) to establish a more resonable mean and standard deviation for the stock ratio before opening up positions. The hope would be to eliminate the cluster of positions at the beinging of the data by obtaining a reasonable standard deviation. Below we can see the updated strategy; we do end up making a profit with this method, but still not as great a profit as our first strategy.
+
+```{r echo=FALSE}
+findPositionsExtension2 <- function(ratio, m, s, k=1) {
+  len <- length(ratio)
+  if (len <= 750) {
+    stop('Not enough data')
+  }
+  toReturn <- list(); lind <- 1
+  finger <- 750
+  openquestionmark <- FALSE
+  
+  while (finger < len) {
+    
+    if (!openquestionmark) { #means we have to find the first place to open a position
+      if (ratio[finger] > m[finger]+s[finger]*k) {
+        start <- finger
+        finger <- finger + 1
+        highorlow <- 1
+        openquestionmark <- TRUE
+      }
+      else if (ratio[finger] < m[finger]-s[finger]*k) {
+        start <- finger
+        finger <- finger + 1
+        highorlow <- -1
+        openquestionmark <- TRUE
+      }
+      else {
+        finger <- finger + 1
+      }
+    }
+    
+    else { #find a place to close position
+      if (highorlow == 1) {
+        while (openquestionmark) {
+          if (ratio[finger]<m[finger]) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            lind <- lind + 1
+            openquestionmark <- FALSE
+          }
+          else if (finger == len) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            openquestionmark <- FALSE
+          }
+          else {
+            finger <- finger + 1
+          }
+        }
+      }
+      else {
+        while(openquestionmark) {
+          if (ratio[finger]>m[finger]) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            lind <- lind + 1
+            openquestionmark <- FALSE
+          }
+          else if (finger == len) {
+            toReturn[[lind]] <- c(start, finger, -1)
+            openquestionmark <- FALSE
+          }
+          else {
+            finger <- finger + 1
+          }
+        }
+      }
+    }
+  }
+  return(toReturn)
+}
+plotRatioExtension2 <- function(stockDF, k=1) {
+  plotRatioExtension(stockDF, k=k)
+  abline(v=750)
+}
+
+len <- nrow(athleisure10)
+m <- numeric(len); s <- numeric(len)
+for (i in 1:len) {
+  m[i] <- mean(athleisure10$ratio[1:i])
+  s[i] <- sd(athleisure10$ratio[1:i])
+}
+pos2 <- findPositionsExtension2(athleisure10$ratio, m, s, k=1)
+plotRatioExtension2(athleisure10)
+addPositions(athleisure10$ratio, pos2)
+message('Profit: ',positionProfit(athleisure10,pos2))
+```
+
+Now we will manipulate $k$ like before to find the maximum profit using this new approach. The optimal value of $k$ ends up giving us a profit of $\$2.16$, or a 28% decrease in profit from the first strategy.
+
+```{r echo=FALSE}
+findOptimalKExtension <- function(stocksDF, plot=FALSE) {
+  ratio <- stocksDF$ratio
+  len <- length(ratio)
+  m <- numeric(len); s <- numeric(len)
+  for (i in 1:len) {
+    m[i] <- mean(ratio[1:i])
+    s[i] <- sd(ratio[1:i])
+  }
+  kmax <- max(abs(ratio[750:len]-m[750:len])/s[750:len])
+  kvalues <- seq(0, kmax, length.out = 100)
+  kprof <- sapply(kvalues, function(x) positionProfit(stocksDF = stocksDF,
+                                                      findPositionsExtension2(ratio, m, s, k=x)))
+  ind <- which(kprof == max(kprof))[1]
+  bestk <- kvalues[ind]
+  
+  if (plot) {
+    plot(x=kvalues, y=kprof, type='p',
+         xlab='k value', ylab='Profit')
+    points(x=bestk, y=kprof[ind], pch=19, col='red')
+  }
+  
+  toReturn <- c(bestk, kprof[ind])
+  return(toReturn)
+}
+best <- findOptimalKExtension(athleisure10, plot = TRUE)
+message("The optimal value k=",best[1]," gives us a profit of ",best[2])
+```
+
+The last hope for the new strategy is to outperform the old strategy in an evaluation setting. In the real world we would have to set our k before implementing the strategy. From all the data after 750 days, we will use the first half to determine our optimal k, and the second half will be the data we implement the strategy on. Unfortuanately, for our athletic-wear data set, the optimal k for the training data was very high, so we ended up opening no positions and having a profit of zero—at least it is better than a loss!
+
+```{r echo=FALSE}
+findPositionsExtensionHelper <- function(ratio, m, s, k=1) {
+  len <- length(ratio)
+  toReturn <- list(); lind <- 1
+  finger <- 1
+  openquestionmark <- FALSE
+  
+  while (finger < len) {
+    
+    if (!openquestionmark) { #means we have to find the first place to open a position
+      if (ratio[finger] > m[finger]+s[finger]*k) {
+        start <- finger
+        finger <- finger + 1
+        highorlow <- 1
+        openquestionmark <- TRUE
+      }
+      else if (ratio[finger] < m[finger]-s[finger]*k) {
+        start <- finger
+        finger <- finger + 1
+        highorlow <- -1
+        openquestionmark <- TRUE
+      }
+      else {
+        finger <- finger + 1
+      }
+    }
+    
+    else { #find a place to close position
+      if (highorlow == 1) {
+        while (openquestionmark) {
+          if (ratio[finger]<m[finger]) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            lind <- lind + 1
+            openquestionmark <- FALSE
+          }
+          else if (finger == len) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            openquestionmark <- FALSE
+          }
+          else {
+            finger <- finger + 1
+          }
+        }
+      }
+      else {
+        while(openquestionmark) {
+          if (ratio[finger]>m[finger]) {
+            toReturn[[lind]] <- c(start, finger, 1)
+            lind <- lind + 1
+            openquestionmark <- FALSE
+          }
+          else if (finger == len) {
+            toReturn[[lind]] <- c(start, finger, -1)
+            openquestionmark <- FALSE
+          }
+          else {
+            finger <- finger + 1
+          }
+        }
+      }
+    }
+  }
+  return(toReturn)
+}
+evaluatePairsTradingExtension <- function(stocksDF, trainingFrac = 0.5, plot = FALSE) {
+  cutoff <- ceiling((nrow(stocksDF)-750)*trainingFrac)
+  k <- findOptimalKExtension(stocksDF[1:(cutoff+750),])[1]
+  
+  ratio <- stocksDF$ratio; len <- length(ratio)
+  m <- numeric(len); s <- numeric(len)
+  for (i in 1:len) {
+    m[i] <- mean(stocksDF$ratio[1:i])
+    s[i] <- sd(stocksDF$ratio[1:i])
+  }
+  
+  pos <- findPositionsExtensionHelper(ratio[(cutoff+751):len],
+                                      m[(cutoff+751):len],
+                                      s[(cutoff+751):len],
+                                      k = k)
+  
+  if (plot) {
+    plotRatioExtension2(stocksDF, k=k)
+    for (p in pos) {
+      points(x=p[1]+cutoff+750,y=stocksDF$ratio[p[1]+cutoff+750],col='green',pch=19)
+      points(x=p[2]+cutoff+750,y=stocksDF$ratio[p[2]+cutoff+750],col='red',pch=19)
+    }
+    abline(v=cutoff+750, lty=2)
+  }  
+  
+  test <- stocksDF[(cutoff+751):len,]
+  return(positionProfit(test, pos))
+}
+prof <- evaluatePairsTradingExtension(athleisure10, plot = TRUE)
+```
+```{r echo=FALSE}
+message('Profits for Netflix and Regal Cinemas: ',evaluatePairsTradingExtension(movies10))
+
+message('Profits for Chesapeak Energy and Lakeland Shipping: ',evaluatePairsTradingExtension(energyandshipping10))
+
+message('Profits for Gravity and Exxon-Mobile: ',evaluatePairsTradingExtension(gamesandoil10))
+```
+
+On the other hand, the new strategy outperforms the old one for the Netflix/Regal pair and on the Gravity/Exxon-Mobile pair. Of significance is the Netflix/Regal pair; the first strategy had us losing over three dollars, while the new strategy costs us six cents. Also of note is the fact that we end up making significantly more on the Energy/Shipping pair than before, but we have doubled our losses on the Gravity/Exxon pair. Just from this small sample of four stock pairs, it seems like the new strategy contains less risk. For example, we make the most profit in the Nike/Under Armour pair by opening only one position around the 800 day mark when the ratio climbs very high. When we ran the strategy bifurcating the data into a training set and test set, the use of updated mean and standard devation means that it would take an even larger spike in order to open up a position. This is why our losses for buying Netflix are so much lower using the new strategy; we now require a larger over-valuation of a stock before we short it. Both strategies have their boons and flaws, and we can look forward to more experimentation and refining to create the best possible pairs trading strategy.
